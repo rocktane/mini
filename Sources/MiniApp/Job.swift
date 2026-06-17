@@ -52,6 +52,7 @@ final class Job {
         let frame = NSRect(x: 0, y: 0, width: max(cols, 80) * 8, height: max(rows, 24) * 16)
         self.terminalView = LocalProcessTerminalView(frame: frame)
         Self.hideScrollers(in: self.terminalView)
+        ThemeManager.shared.apply(to: self.terminalView)
     }
 
     /// SwiftTerm adds a private `NSScroller` subview; hide it so the preview and window render flush.

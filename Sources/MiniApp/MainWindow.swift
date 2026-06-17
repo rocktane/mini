@@ -167,6 +167,9 @@ final class MainWindowController: NSObject {
             }
         }
 
+        // Re-skin every open terminal when the theme changes from Settings.
+        ThemeManager.shared.onChange = { [weak self] in self?.applyThemeToAll() }
+
         // Dismiss the dropdown when the user clicks in another app (menu-bar behavior).
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             guard let self, self.isPanelOpen else { return }
@@ -564,6 +567,15 @@ final class MainWindowController: NSObject {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(string, forType: .string)
+    }
+
+    /// Re-applies the active theme to every open terminal and refreshes the pane chrome.
+    private func applyThemeToAll() {
+        for job in store.jobs { ThemeManager.shared.apply(to: job.terminalView) }
+        if let view = shownView {
+            terminalHost.layer?.backgroundColor = view.nativeBackgroundColor.cgColor
+            terminalHeader.layer?.backgroundColor = view.nativeBackgroundColor.cgColor
+        }
     }
 
     private func updateTitle() {
