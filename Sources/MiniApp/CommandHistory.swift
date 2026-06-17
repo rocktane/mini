@@ -7,12 +7,34 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
     let cwd: String
     var lastRun: Date
     var runCount: Int
+    var pinned: Bool
 
     var command: String { argv.joined(separator: " ") }
 
     var displayCwd: String {
         let url = URL(fileURLWithPath: cwd)
         return url.lastPathComponent.isEmpty ? cwd : url.lastPathComponent
+    }
+
+    init(id: UUID, argv: [String], cwd: String, lastRun: Date, runCount: Int, pinned: Bool = false) {
+        self.id = id
+        self.argv = argv
+        self.cwd = cwd
+        self.lastRun = lastRun
+        self.runCount = runCount
+        self.pinned = pinned
+    }
+
+    // Decode `pinned` leniently so history files written before pinning still load.
+    enum CodingKeys: String, CodingKey { case id, argv, cwd, lastRun, runCount, pinned }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        argv = try c.decode([String].self, forKey: .argv)
+        cwd = try c.decode(String.self, forKey: .cwd)
+        lastRun = try c.decode(Date.self, forKey: .lastRun)
+        runCount = try c.decode(Int.self, forKey: .runCount)
+        pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
     }
 }
 
@@ -51,6 +73,12 @@ final class HistoryStore: ObservableObject {
 
     func remove(id: UUID) {
         entries.removeAll { $0.id == id }
+        save()
+    }
+
+    func togglePin(id: UUID) {
+        guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
+        entries[idx].pinned.toggle()
         save()
     }
 

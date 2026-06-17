@@ -30,6 +30,10 @@ final class Job {
     /// Human-facing form of `detectedURL` for the row pill (e.g. "localhost:3000").
     var detectedHostPort: String?
 
+    /// Live resource usage of the job's process tree, sampled while the panel is open.
+    var cpuPercent: Double?
+    var memBytes: UInt64?
+
     /// Next scroll-invariant row to scan for monitor signals (errors, prompts).
     var nextScanRow: Int = 0
     /// Hash of the last line that produced a notification; used to dedupe.

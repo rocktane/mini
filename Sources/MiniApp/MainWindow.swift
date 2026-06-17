@@ -43,6 +43,9 @@ final class MainWindowController: NSObject {
     private static let terminalInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 10)
 
     private var refreshTimer: Timer?
+    private var keyMonitor: Any?
+    private var resourceSampler: ResourceSampler!
+    private var searchText = ""
 
     init(store: JobStore, history: HistoryStore) {
         self.store = store
@@ -142,6 +145,27 @@ final class MainWindowController: NSObject {
         sidebar.onModeChange = { [weak self] newMode in self?.setMode(newMode) }
         sidebar.onRunHistory = { [weak self] entry in self?.runFromHistory(entry) }
         sidebar.historyMenuProvider = { [weak self] id in self?.historyContextMenu(for: id) }
+        sidebar.onSearch = { [weak self] text in self?.applySearch(text) }
+        sidebar.onNewCommand = { [weak self] in self?.quickLaunch() }
+        sidebar.onClearHistory = { [weak self] in self?.clearHistory() }
+
+        setupHeaderControls()
+
+        resourceSampler = ResourceSampler(store: store)
+        resourceSampler.onUpdate = { [weak self] in
+            guard let self, self.mode == .jobs else { return }
+            self.sidebar.refreshDynamic(jobs: self.store.jobs)
+        }
+
+        // Cmd-Up / Cmd-Down cycle through jobs while the panel is open.
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.isPanelOpen, event.modifierFlags.contains(.command) else { return event }
+            switch event.keyCode {
+            case 125: self.cycleSelection(forward: true); return nil
+            case 126: self.cycleSelection(forward: false); return nil
+            default: return event
+            }
+        }
 
         // Dismiss the dropdown when the user clicks in another app (menu-bar behavior).
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
@@ -192,6 +216,7 @@ final class MainWindowController: NSObject {
         isPanelOpen = true
         reloadSidebar()
         startRefreshTimer()
+        resourceSampler.setActive(true)
     }
 
     func show(relativeTo button: NSStatusBarButton, selecting job: Job) {
@@ -203,6 +228,7 @@ final class MainWindowController: NSObject {
         panel.orderOut(nil)
         isPanelOpen = false
         stopRefreshTimer()
+        resourceSampler.setActive(false)
     }
 
     /// Keeps time-based sidebar fields (job age, live status) ticking while the panel is visible.
@@ -326,11 +352,18 @@ final class MainWindowController: NSObject {
     }
 
     private func reloadSidebar() {
+        let query = searchText.lowercased()
         switch mode {
         case .jobs:
-            sidebar.showJobs(store.jobs, selectedId: selectedJobId)
+            let jobs = query.isEmpty ? store.jobs : store.jobs.filter {
+                $0.displayCommand.lowercased().contains(query) || $0.displayCwd.lowercased().contains(query)
+            }
+            sidebar.showJobs(jobs, selectedId: selectedJobId)
         case .history:
-            sidebar.showHistory(history.entries)
+            let entries = query.isEmpty ? history.entries : history.entries.filter {
+                $0.command.lowercased().contains(query) || $0.displayCwd.lowercased().contains(query)
+            }
+            sidebar.showHistory(entries)
         }
     }
 
@@ -338,6 +371,26 @@ final class MainWindowController: NSObject {
         mode = newMode
         sidebar.setSelectedMode(newMode)
         reloadSidebar()
+    }
+
+    private func applySearch(_ text: String) {
+        searchText = text
+        reloadSidebar()
+    }
+
+    /// Cmd-Up / Cmd-Down: move selection to the next/previous job, wrapping around.
+    private func cycleSelection(forward: Bool) {
+        let jobs = store.jobs
+        guard !jobs.isEmpty else { return }
+        let current = selectedJobId.flatMap { id in jobs.firstIndex(where: { $0.id == id }) }
+        let next: Int
+        if let current {
+            next = forward ? (current + 1) % jobs.count : (current - 1 + jobs.count) % jobs.count
+        } else {
+            next = forward ? 0 : jobs.count - 1
+        }
+        if mode != .jobs { setMode(.jobs) }
+        userSelected(jobs[next].id)
     }
 
     /// Re-launches a past command in its original directory, then returns to the jobs view on it.
@@ -355,29 +408,35 @@ final class MainWindowController: NSObject {
         guard let entry = history.entries.first(where: { $0.id == id }) else { return nil }
         let menu = NSMenu()
 
-        let run = NSMenuItem(title: "Run Again", action: #selector(runHistoryItem(_:)), keyEquivalent: "")
-        run.target = self
-        run.representedObject = entry
-        menu.addItem(run)
+        func add(_ title: String, _ action: Selector, represented: Any) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = represented
+            menu.addItem(item)
+        }
 
-        let reveal = NSMenuItem(title: "Reveal cwd in Finder", action: #selector(revealHistoryItem(_:)), keyEquivalent: "")
-        reveal.target = self
-        reveal.representedObject = entry
-        menu.addItem(reveal)
-
+        add("Run Again", #selector(runHistoryItem(_:)), represented: entry)
+        add("Edit & Run…", #selector(editHistoryItem(_:)), represented: entry)
+        add(entry.pinned ? "Unpin" : "Pin", #selector(pinHistoryItem(_:)), represented: id as NSUUID)
+        add("Reveal cwd in Finder", #selector(revealHistoryItem(_:)), represented: entry)
         menu.addItem(.separator())
-
-        let remove = NSMenuItem(title: "Remove from History", action: #selector(removeHistoryItem(_:)), keyEquivalent: "")
-        remove.target = self
-        remove.representedObject = id as NSUUID
-        menu.addItem(remove)
-
+        add("Remove from History", #selector(removeHistoryItem(_:)), represented: id as NSUUID)
         return menu
     }
 
     @objc private func runHistoryItem(_ sender: NSMenuItem) {
         guard let entry = sender.representedObject as? HistoryEntry else { return }
         runFromHistory(entry)
+    }
+
+    @objc private func editHistoryItem(_ sender: NSMenuItem) {
+        guard let entry = sender.representedObject as? HistoryEntry else { return }
+        runCommandDialog(title: "Edit & Run", command: entry.command, cwd: entry.cwd)
+    }
+
+    @objc private func pinHistoryItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? NSUUID else { return }
+        history.togglePin(id: id as UUID)
     }
 
     @objc private func revealHistoryItem(_ sender: NSMenuItem) {
@@ -388,6 +447,123 @@ final class MainWindowController: NSObject {
     @objc private func removeHistoryItem(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? NSUUID else { return }
         history.remove(id: id as UUID)
+    }
+
+    // MARK: - Quick launch / clear
+
+    private func quickLaunch() {
+        runCommandDialog(title: "New Command", command: "",
+                         cwd: FileManager.default.homeDirectoryForCurrentUser.path)
+    }
+
+    /// Prompts for a command + working directory, then spawns it. Used by quick-launch and edit-&-run.
+    private func runCommandDialog(title: String, command: String, cwd: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+
+        let cmdField = NSTextField(frame: NSRect(x: 0, y: 30, width: 340, height: 24))
+        cmdField.placeholderString = "e.g. npm run dev"
+        cmdField.stringValue = command
+        let dirField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        dirField.placeholderString = "working directory"
+        dirField.stringValue = cwd
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 58))
+        accessory.addSubview(cmdField)
+        accessory.addSubview(dirField)
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: "Run")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = cmdField
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let line = cmdField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty else { return }
+        let argv = line.split(separator: " ").map(String.init)
+        let dir = dirField.stringValue.trimmingCharacters(in: .whitespaces)
+        let id = store.spawn(argv: argv,
+                             cwd: dir.isEmpty ? FileManager.default.homeDirectoryForCurrentUser.path : dir,
+                             env: ProcessInfo.processInfo.environment, cols: 120, rows: 30)
+        if !searchText.isEmpty { searchText = ""; sidebar.clearSearch() }
+        setMode(.jobs)
+        userSelected(id)
+    }
+
+    private func clearHistory() {
+        let alert = NSAlert()
+        alert.messageText = "Clear command history?"
+        alert.informativeText = "This removes all recorded commands. Pinned commands are removed too."
+        alert.addButton(withTitle: "Clear")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        history.clear()
+        reloadSidebar()
+    }
+
+    // MARK: - Copy (terminal output tools)
+
+    private var selectedJob: Job? { selectedJobId.flatMap { store.job(id: $0) } }
+
+    private func setupHeaderControls() {
+        let copy = NSButton(title: "Copy ▾", target: self, action: #selector(copyMenu(_:)))
+        copy.isBordered = false
+        copy.attributedTitle = NSAttributedString(string: "Copy ▾", attributes: [
+            .foregroundColor: NSColor.white.withAlphaComponent(0.65),
+            .font: NSFont.systemFont(ofSize: 11),
+        ])
+        copy.sizeToFit()
+        let width = copy.frame.width + 6
+        copy.frame = NSRect(x: terminalHeader.bounds.width - width - 8,
+                            y: (Self.headerHeight - 18) / 2, width: width, height: 18)
+        copy.autoresizingMask = [.minXMargin]
+        copy.toolTip = "Copy command / output"
+        terminalHeader.addSubview(copy)
+        headerLabel.frame.size.width = copy.frame.minX - headerLabel.frame.minX - 8
+    }
+
+    @objc private func copyMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        let items: [(String, Selector)] = [
+            ("Copy command", #selector(copyCommand)),
+            ("Copy output", #selector(copyOutput)),
+            ("Copy command + output", #selector(copyCommandAndOutput)),
+        ]
+        for (title, action) in items {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    @objc private func copyCommand() {
+        guard let job = selectedJob else { return }
+        setClipboard(job.displayCommand)
+    }
+
+    @objc private func copyOutput() {
+        guard let job = selectedJob else { return }
+        setClipboard(Self.terminalText(job))
+    }
+
+    @objc private func copyCommandAndOutput() {
+        guard let job = selectedJob else { return }
+        setClipboard(job.displayCommand + "\n\n" + Self.terminalText(job))
+    }
+
+    private static func terminalText(_ job: Job) -> String {
+        let data = job.terminalView.getTerminal().getBufferAsData()
+        var text = String(data: data, encoding: .utf8) ?? ""
+        while let last = text.last, last == "\n" || last == " " || last == "\t" { text.removeLast() }
+        return text
+    }
+
+    private func setClipboard(_ string: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(string, forType: .string)
     }
 
     private func updateTitle() {
@@ -461,7 +637,7 @@ enum RowMetrics {
 /// Right-hand job list: section headers, selectable rows with status + unseen-signal badges,
 /// inline action buttons on the selected row, and a footer with Settings / Quit.
 @MainActor
-final class JobSidebar: NSView {
+final class JobSidebar: NSView, NSSearchFieldDelegate {
     var onSelect: ((UUID) -> Void)?
     var onJobAction: ((UUID, JobRowAction) -> Void)?
     var onSettings: (() -> Void)?
@@ -469,16 +645,22 @@ final class JobSidebar: NSView {
     var onModeChange: ((SidebarMode) -> Void)?
     var onRunHistory: ((HistoryEntry) -> Void)?
     var historyMenuProvider: ((UUID) -> NSMenu?)?
+    var onSearch: ((String) -> Void)?
+    var onNewCommand: (() -> Void)?
+    var onClearHistory: (() -> Void)?
 
     private let scrollView = NSScrollView()
     private let listView = FlippedView()
     private let segmented = NSSegmentedControl(labels: ["Jobs", "History"],
                                                trackingMode: .selectOne, target: nil, action: nil)
+    private let searchField = NSSearchField()
+    private let clearButton = NSButton()
     private var rowsById: [UUID: JobRowView] = [:]
 
     private static let headerHeight: CGFloat = 26
     private static let footerHeight: CGFloat = 40
     private static let topBarHeight: CGFloat = 40
+    private static let searchBarHeight: CGFloat = 36
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -511,7 +693,7 @@ final class JobSidebar: NSView {
 
         addSubview(footer)
 
-        // Top bar with the Jobs / History toggle, pinned to the top.
+        // Top bar: Jobs / History toggle + "new command" button, pinned to the top.
         let topBar = NSView(frame: NSRect(x: 0, y: frameRect.height - Self.topBarHeight,
                                           width: frameRect.width, height: Self.topBarHeight))
         topBar.autoresizingMask = [.width, .minYMargin]
@@ -520,13 +702,18 @@ final class JobSidebar: NSView {
         segmented.selectedSegment = 0
         segmented.target = self
         segmented.action = #selector(segmentChanged)
-        segmented.sizeToFit()
-        let segWidth = min(frameRect.width - 24, max(segmented.frame.width, 180))
-        segmented.frame = NSRect(x: (frameRect.width - segWidth) / 2,
-                                 y: (Self.topBarHeight - 24) / 2,
-                                 width: segWidth, height: 24)
-        segmented.autoresizingMask = [.minXMargin, .maxXMargin]
+        segmented.frame = NSRect(x: 10, y: (Self.topBarHeight - 24) / 2,
+                                 width: frameRect.width - 56, height: 24)
+        segmented.autoresizingMask = [.width]
         topBar.addSubview(segmented)
+
+        let newButton = NSButton(title: "＋", target: self, action: #selector(newClicked))
+        newButton.isBordered = false
+        newButton.font = .systemFont(ofSize: 17, weight: .regular)
+        newButton.frame = NSRect(x: frameRect.width - 38, y: (Self.topBarHeight - 26) / 2, width: 28, height: 26)
+        newButton.autoresizingMask = [.minXMargin]
+        newButton.toolTip = "New command"
+        topBar.addSubview(newButton)
 
         let topBorder = NSBox(frame: NSRect(x: 0, y: 0, width: frameRect.width, height: 1))
         topBorder.boxType = .custom
@@ -536,10 +723,38 @@ final class JobSidebar: NSView {
         topBar.addSubview(topBorder)
         addSubview(topBar)
 
-        // Scrollable list between the top bar and the footer.
+        // Search bar with a Clear button (Clear shown only in History mode).
+        let searchBarY = frameRect.height - Self.topBarHeight - Self.searchBarHeight
+        let searchBar = NSView(frame: NSRect(x: 0, y: searchBarY, width: frameRect.width, height: Self.searchBarHeight))
+        searchBar.autoresizingMask = [.width, .minYMargin]
+
+        clearButton.title = "Clear"
+        clearButton.isBordered = false
+        clearButton.font = .systemFont(ofSize: 11)
+        clearButton.target = self
+        clearButton.action = #selector(clearClicked)
+        clearButton.sizeToFit()
+        clearButton.frame = NSRect(x: frameRect.width - clearButton.frame.width - 10,
+                                   y: (Self.searchBarHeight - 20) / 2,
+                                   width: clearButton.frame.width, height: 20)
+        clearButton.autoresizingMask = [.minXMargin]
+        clearButton.isHidden = true
+        searchBar.addSubview(clearButton)
+
+        searchField.placeholderString = "Filter…"
+        searchField.controlSize = .small
+        searchField.font = .systemFont(ofSize: 12)
+        searchField.delegate = self
+        searchField.frame = NSRect(x: 10, y: (Self.searchBarHeight - 22) / 2,
+                                   width: frameRect.width - 20, height: 22)
+        searchField.autoresizingMask = [.width]
+        searchBar.addSubview(searchField)
+        addSubview(searchBar)
+
+        // Scrollable list between the search bar and the footer.
         scrollView.frame = NSRect(x: 0, y: Self.footerHeight,
                                   width: frameRect.width,
-                                  height: frameRect.height - Self.footerHeight - Self.topBarHeight)
+                                  height: frameRect.height - Self.footerHeight - Self.topBarHeight - Self.searchBarHeight)
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.scrollerStyle = .overlay
@@ -552,8 +767,24 @@ final class JobSidebar: NSView {
         onModeChange?(segmented.selectedSegment == 0 ? .jobs : .history)
     }
 
+    @objc private func newClicked() { onNewCommand?() }
+    @objc private func clearClicked() { onClearHistory?() }
+
+    func controlTextDidChange(_ obj: Notification) {
+        onSearch?(searchField.stringValue)
+    }
+
+    func clearSearch() {
+        searchField.stringValue = ""
+        onSearch?("")
+    }
+
     func setSelectedMode(_ mode: SidebarMode) {
         segmented.selectedSegment = (mode == .jobs) ? 0 : 1
+        let isHistory = (mode == .history)
+        clearButton.isHidden = !isHistory
+        let rightInset: CGFloat = isHistory ? (clearButton.frame.width + 18) : 10
+        searchField.frame.size.width = bounds.width - 10 - rightInset
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -614,20 +845,29 @@ final class JobSidebar: NSView {
         let width = bounds.width
         var y: CGFloat = 8
 
-        if entries.isEmpty {
-            listView.addSubview(Self.makeHeader("No history yet", width: width, y: y))
+        func addSection(_ title: String, _ list: [HistoryEntry]) {
+            guard !list.isEmpty else { return }
+            listView.addSubview(Self.makeHeader(title, width: width, y: y))
             y += Self.headerHeight
-        } else {
-            listView.addSubview(Self.makeHeader("Recent", width: width, y: y))
-            y += Self.headerHeight
-            for entry in entries {
+            for entry in list {
                 let h = HistoryRowView.height(for: entry, width: width)
-                let row = HistoryRowView(entry: entry, width: width, y: y, height: h)
+                let row = HistoryRowView(entry: entry, pinned: entry.pinned, width: width, y: y, height: h)
                 row.onRun = { [weak self] in self?.onRunHistory?(entry) }
                 row.contextMenuProvider = { [weak self] in self?.historyMenuProvider?(entry.id) }
                 listView.addSubview(row)
                 y += h
             }
+        }
+
+        if entries.isEmpty {
+            listView.addSubview(Self.makeHeader("No history yet", width: width, y: y))
+            y += Self.headerHeight
+        } else {
+            let pinned = entries.filter { $0.pinned }
+            let recent = entries.filter { !$0.pinned }
+            addSection("Pinned", pinned)
+            if !pinned.isEmpty && !recent.isEmpty { y += 8 }
+            addSection("Recent", recent)
         }
 
         let visibleHeight = scrollView.contentView.bounds.height
@@ -813,10 +1053,20 @@ final class JobRowView: NSView {
     private static func subtitle(for job: Job) -> String {
         switch job.status {
         case .running:
+            // Drop the cwd when resources are shown — the cwd already lives in the terminal header.
+            if let cpu = job.cpuPercent, let mem = job.memBytes {
+                return "\(job.ageDescription) · \(Int(cpu.rounded()))% · \(formatBytes(mem))"
+            }
             return "\(job.displayCwd) · \(job.ageDescription)"
         case .stopped(let code):
             return code == 0 ? "\(job.displayCwd) · exited" : "\(job.displayCwd) · exit \(code)"
         }
+    }
+
+    private static func formatBytes(_ bytes: UInt64) -> String {
+        let mb = Double(bytes) / (1024 * 1024)
+        if mb >= 1024 { return String(format: "%.1f GB", mb / 1024) }
+        return "\(Int(mb.rounded())) MB"
     }
 
     private static func makeBadge(count: Int) -> NSView {
@@ -852,7 +1102,7 @@ final class HistoryRowView: NSView {
         max(40, width - RowMetrics.textX - RowMetrics.rightPad)
     }
 
-    init(entry: HistoryEntry, width: CGFloat, y: CGFloat, height: CGFloat) {
+    init(entry: HistoryEntry, pinned: Bool, width: CGFloat, y: CGFloat, height: CGFloat) {
         super.init(frame: NSRect(x: 0, y: y, width: width, height: height))
         autoresizingMask = [.width]
         wantsLayer = true
@@ -863,8 +1113,9 @@ final class HistoryRowView: NSView {
         let firstLineCenter = titleMaxY - RowMetrics.titleLineHeight / 2
 
         let icon = NSImageView(frame: NSRect(x: 12, y: firstLineCenter - 7, width: 14, height: 14))
-        icon.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Run again")
-        icon.contentTintColor = .tertiaryLabelColor
+        icon.image = NSImage(systemSymbolName: pinned ? "pin.fill" : "arrow.clockwise",
+                             accessibilityDescription: pinned ? "Pinned" : "Run again")
+        icon.contentTintColor = pinned ? .controlAccentColor : .tertiaryLabelColor
         addSubview(icon)
 
         let title = NSTextField(wrappingLabelWithString: entry.command)

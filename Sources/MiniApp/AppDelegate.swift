@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Combine
 import UserNotifications
 
@@ -10,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var server: SocketServer!
     private var monitor: OutputMonitor!
     private var mainWindow: MainWindowController!
+    private var hotKey: GlobalHotKey?
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -43,6 +45,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         Notifier.shared.requestAuthorization()
         monitor = OutputMonitor(store: store)
         monitor.start()
+
+        // Global hotkey ⌃⌥M toggles the panel from anywhere.
+        hotKey = GlobalHotKey(keyCode: UInt32(kVK_ANSI_M),
+                              modifiers: UInt32(controlKey | optionKey)) { [weak self] in
+            MainActor.assumeIsolated { self?.toggleFromHotKey() }
+        }
+    }
+
+    private func toggleFromHotKey() {
+        guard let button = statusItem.button else { return }
+        mainWindow.toggle(relativeTo: button)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
