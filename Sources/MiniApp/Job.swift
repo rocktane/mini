@@ -18,10 +18,17 @@ final class Job {
     var stoppedAt: Date?
 
     /// Live terminal view that owns the PTY and rendered scrollback.
-    /// Created once at spawn, kept alive even when no window is shown.
+    /// Created once at spawn, kept alive even when not the selected job.
     let terminalView: LocalProcessTerminalView
 
-    var window: NSWindow?
+    /// Latest OS-reported terminal title (from the running program), if any.
+    var terminalTitle: String?
+
+    /// A local server address detected in the job's output (e.g. "http://localhost:3000"),
+    /// surfaced as an "open in browser" affordance. Set once, on first detection.
+    var detectedURL: String?
+    /// Human-facing form of `detectedURL` for the row pill (e.g. "localhost:3000").
+    var detectedHostPort: String?
 
     /// Next scroll-invariant row to scan for monitor signals (errors, prompts).
     var nextScanRow: Int = 0

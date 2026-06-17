@@ -7,8 +7,12 @@ import SwiftTerm
 final class JobStore: NSObject, ObservableObject, LocalProcessTerminalViewDelegate {
     @Published private(set) var jobs: [Job] = []
 
+    /// Records launched commands for the history view. Set by the app delegate.
+    var history: HistoryStore?
+
     /// Spawns a new job, returns its id immediately.
     func spawn(argv: [String], cwd: String, env: [String: String], cols: Int, rows: Int) -> UUID {
+        history?.record(argv: argv, cwd: cwd)
         let job = Job(id: UUID(), argv: argv, cwd: cwd, env: env, cols: cols, rows: rows)
         job.terminalView.processDelegate = self
 
@@ -47,7 +51,6 @@ final class JobStore: NSObject, ObservableObject, LocalProcessTerminalViewDelega
     func remove(id: UUID) {
         if let job = job(id: id) {
             terminate(job)
-            job.window?.close()
         }
         jobs.removeAll { $0.id == id }
         objectWillChange.send()
@@ -80,10 +83,21 @@ final class JobStore: NSObject, ObservableObject, LocalProcessTerminalViewDelega
         MainActor.assumeIsolated {
             guard let view = source as? LocalProcessTerminalView,
                   let job = job(for: view) else { return }
-            job.status = .stopped(exitCode: exitCode ?? -1)
+            job.status = .stopped(exitCode: Self.decodeExitCode(exitCode))
             job.stoppedAt = Date()
             objectWillChange.send()
         }
+    }
+
+    /// SwiftTerm's legacy local-process path reports the raw `waitpid` status (e.g. 768 for
+    /// `exit 3`), while its modern path reports an already-decoded code. Normalize to the real
+    /// exit code: decode a raw "exited" status, and pass clean codes / signal cases through.
+    private static func decodeExitCode(_ raw: Int32?) -> Int32 {
+        guard let raw = raw else { return -1 }
+        if raw > 255 && (raw & 0x7f) == 0 {
+            return (raw >> 8) & 0xff
+        }
+        return raw
     }
 
     nonisolated func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
@@ -91,7 +105,8 @@ final class JobStore: NSObject, ObservableObject, LocalProcessTerminalViewDelega
     nonisolated func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
         MainActor.assumeIsolated {
             if let job = job(for: source) {
-                job.window?.title = title.isEmpty ? job.displayCommand : title
+                job.terminalTitle = title.isEmpty ? nil : title
+                objectWillChange.send()
             }
         }
     }

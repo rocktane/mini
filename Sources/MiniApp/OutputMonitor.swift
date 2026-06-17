@@ -69,6 +69,10 @@ final class OutputMonitor {
         let previous = lastSnapshot[job.id]
         lastSnapshot[job.id] = current
 
+        // Server-address detection runs on every visible line (including the first screenful),
+        // since dev servers usually print the URL at startup.
+        detectServerURL(in: current, for: job)
+
         // Baseline pass: don't notify on lines that were already on screen when we started.
         guard let previous = previous else { return }
 
@@ -80,10 +84,35 @@ final class OutputMonitor {
                 if hash != job.lastNotifiedLineHash {
                     job.lastNotifiedLineHash = hash
                     job.unseenSignalCount += 1
+                    // Surface the new unseen-signal badge in the sidebar immediately.
+                    store?.objectWillChange.send()
                     Notifier.shared.notify(job: job, signal: signal, text: line)
                     return
                 }
             }
+        }
+    }
+
+    /// Matches a local server address with an explicit port, optionally prefixed by a scheme.
+    private static let localhostRegex = try! NSRegularExpression(
+        pattern: "(?:https?://)?(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0):(\\d{2,5})",
+        options: [.caseInsensitive]
+    )
+
+    /// Records the first local server address found in the output so the sidebar can offer an
+    /// "open in browser" pill. Detected once per job, then left untouched.
+    private func detectServerURL(in lines: [String], for job: Job) {
+        guard job.detectedURL == nil else { return }
+        for line in lines {
+            let range = NSRange(line.startIndex..<line.endIndex, in: line)
+            guard let match = Self.localhostRegex.firstMatch(in: line, range: range),
+                  let portRange = Range(match.range(at: 1), in: line) else { continue }
+            let port = String(line[portRange])
+            guard let portNum = Int(port), (1...65535).contains(portNum) else { continue }
+            job.detectedURL = "http://localhost:\(port)"
+            job.detectedHostPort = "localhost:\(port)"
+            store?.objectWillChange.send()
+            return
         }
     }
 
