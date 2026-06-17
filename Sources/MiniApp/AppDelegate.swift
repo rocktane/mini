@@ -46,9 +46,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         monitor = OutputMonitor(store: store)
         monitor.start()
 
-        // Global hotkey ⌃⌥M toggles the panel from anywhere.
-        hotKey = GlobalHotKey(keyCode: UInt32(kVK_ANSI_M),
-                              modifiers: UInt32(controlKey | optionKey)) { [weak self] in
+        // Global hotkey (configurable in Settings) toggles the panel from anywhere.
+        registerHotKey()
+        NotificationCenter.default.addObserver(forName: .miniHotKeyChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.registerHotKey() }
+        }
+    }
+
+    private func registerHotKey() {
+        let config = HotKeyConfig.load()
+        hotKey = nil // release the previous registration before creating the new one
+        hotKey = GlobalHotKey(keyCode: config.keyCode, modifiers: config.carbonModifiers) { [weak self] in
             MainActor.assumeIsolated { self?.toggleFromHotKey() }
         }
     }

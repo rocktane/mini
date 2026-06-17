@@ -8,6 +8,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private let textField: NSTextField
     private let statusLabel: NSTextField
     private let themeLabel: NSTextField
+    private let shortcutButton: NSButton
+    private var recordMonitor: Any?
 
     static func show() {
         if let existing = shared {
@@ -22,7 +24,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     }
 
     private override init() {
-        let height: CGFloat = 380
+        let height: CGFloat = 470
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 460, height: height),
             styleMask: [.titled, .closable],
@@ -32,6 +34,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         window.title = "Mini — Settings"
         window.center()
         window.isReleasedWhenClosed = false
+        // Sit just above the floating dropdown panel so Settings is never hidden behind it.
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
 
         textField = NSTextField()
         textField.placeholderString = "mini, bg, run"
@@ -49,7 +53,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         themeLabel.textColor = .secondaryLabelColor
         themeLabel.font = .systemFont(ofSize: 12)
 
+        shortcutButton = NSButton(title: "", target: nil, action: nil)
+        shortcutButton.bezelStyle = .rounded
+
         super.init()
+
+        shortcutButton.target = self
+        shortcutButton.action = #selector(recordShortcut)
 
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: height))
         let top = height - 16
@@ -67,41 +77,59 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         installButton.frame = NSRect(x: 18, y: top - 84, width: 200, height: 28)
         content.addSubview(installButton)
 
-        statusLabel.frame = NSRect(x: 20, y: top - 124, width: 420, height: 32)
+        statusLabel.frame = NSRect(x: 20, y: top - 116, width: 420, height: 28)
         content.addSubview(statusLabel)
 
-        // MARK: Separator
-        let separator = NSBox(frame: NSRect(x: 20, y: top - 142, width: 420, height: 1))
-        separator.boxType = .separator
-        content.addSubview(separator)
+        content.addSubview(Self.separator(y: top - 136))
+
+        // MARK: Global shortcut
+        let shortcutHeader = Self.header("Global Shortcut")
+        shortcutHeader.frame = NSRect(x: 20, y: top - 164, width: 420, height: 18)
+        content.addSubview(shortcutHeader)
+
+        let shortcutHelp = NSTextField(labelWithString: "Toggle the panel from anywhere. Click, then press the keys.")
+        shortcutHelp.font = .systemFont(ofSize: 11)
+        shortcutHelp.textColor = .secondaryLabelColor
+        shortcutHelp.frame = NSRect(x: 20, y: top - 186, width: 420, height: 16)
+        content.addSubview(shortcutHelp)
+
+        let shortcutLabel = NSTextField(labelWithString: "Shortcut:")
+        shortcutLabel.font = .systemFont(ofSize: 12)
+        shortcutLabel.frame = NSRect(x: 20, y: top - 217, width: 70, height: 18)
+        content.addSubview(shortcutLabel)
+
+        shortcutButton.frame = NSRect(x: 92, y: top - 221, width: 160, height: 26)
+        content.addSubview(shortcutButton)
+
+        content.addSubview(Self.separator(y: top - 244))
 
         // MARK: Terminal theme
         let themeHeader = Self.header("Terminal Theme")
-        themeHeader.frame = NSRect(x: 20, y: top - 174, width: 420, height: 18)
+        themeHeader.frame = NSRect(x: 20, y: top - 272, width: 420, height: 18)
         content.addSubview(themeHeader)
 
         let themeHelp = NSTextField(labelWithString: "Import a color scheme from iTerm2 or Ghostty for the terminal previews.")
         themeHelp.font = .systemFont(ofSize: 11)
         themeHelp.textColor = .secondaryLabelColor
-        themeHelp.frame = NSRect(x: 20, y: top - 196, width: 420, height: 16)
+        themeHelp.frame = NSRect(x: 20, y: top - 294, width: 420, height: 16)
         content.addSubview(themeHelp)
 
-        themeLabel.frame = NSRect(x: 20, y: top - 224, width: 420, height: 18)
+        themeLabel.frame = NSRect(x: 20, y: top - 322, width: 420, height: 18)
         content.addSubview(themeLabel)
 
         let iterm = NSButton(title: "Import iTerm2…", target: self, action: #selector(importITerm))
         iterm.bezelStyle = .rounded
-        iterm.frame = NSRect(x: 18, y: top - 262, width: 140, height: 28)
+        iterm.frame = NSRect(x: 18, y: top - 360, width: 140, height: 28)
         content.addSubview(iterm)
 
         let ghostty = NSButton(title: "Import Ghostty…", target: self, action: #selector(importGhostty))
         ghostty.bezelStyle = .rounded
-        ghostty.frame = NSRect(x: 164, y: top - 262, width: 140, height: 28)
+        ghostty.frame = NSRect(x: 164, y: top - 360, width: 140, height: 28)
         content.addSubview(ghostty)
 
         let reset = NSButton(title: "Reset", target: self, action: #selector(resetTheme))
         reset.bezelStyle = .rounded
-        reset.frame = NSRect(x: 310, y: top - 262, width: 90, height: 28)
+        reset.frame = NSRect(x: 310, y: top - 360, width: 90, height: 28)
         content.addSubview(reset)
 
         // MARK: Done
@@ -116,6 +144,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         refreshStatus()
         refreshTheme()
+        refreshShortcut()
+    }
+
+    private static func separator(y: CGFloat) -> NSBox {
+        let box = NSBox(frame: NSRect(x: 20, y: y, width: 420, height: 1))
+        box.boxType = .separator
+        return box
     }
 
     private static func header(_ text: String) -> NSTextField {
@@ -212,11 +247,48 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         alert.runModal()
     }
 
+    // MARK: - Shortcut
+
+    private func refreshShortcut() {
+        shortcutButton.title = HotKeyConfig.load().display
+    }
+
+    @objc private func recordShortcut() {
+        guard recordMonitor == nil else { return }
+        shortcutButton.title = "Press keys…"
+        recordMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            if event.keyCode == 53 { // Escape cancels
+                self.endRecording()
+                return nil
+            }
+            guard let config = HotKeyConfig.from(event: event) else {
+                NSSound.beep() // needs a control/option/command modifier
+                return nil
+            }
+            config.save()
+            NotificationCenter.default.post(name: .miniHotKeyChanged, object: nil)
+            self.endRecording()
+            return nil
+        }
+    }
+
+    private func endRecording() {
+        if let monitor = recordMonitor {
+            NSEvent.removeMonitor(monitor)
+            recordMonitor = nil
+        }
+        refreshShortcut()
+    }
+
     @objc private func closeAction() {
         window.close()
     }
 
     nonisolated func windowWillClose(_ notification: Notification) {
-        MainActor.assumeIsolated { SettingsWindow.shared = nil }
+        MainActor.assumeIsolated {
+            endRecording()
+            SettingsWindow.shared = nil
+        }
     }
 }
