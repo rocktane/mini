@@ -21,6 +21,8 @@ final class MainWindowController: NSObject {
     private let terminalHost: NSView
     private let emptyLabel: NSTextField
     private let sidebar: JobSidebar
+    /// Hairline between the terminal pane and the menu; hidden when the terminal collapses.
+    private let divider: NSView
 
     /// Terminal-style header above the terminal grid: working directory + command.
     private let terminalHeader: NSView
@@ -34,6 +36,9 @@ final class MainWindowController: NSObject {
 
     private var isPanelOpen = false
     private var globalMonitor: Any?
+    /// Screen point of the panel's top-right corner (under the status item). The panel grows /
+    /// shrinks toward this anchor so its right edge stays put across collapse/expand.
+    private var anchorTopRight: NSPoint?
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -66,15 +71,20 @@ final class MainWindowController: NSObject {
         panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
+        // Allow the panel to shrink to just the menu (a visible resizable window otherwise
+        // refuses to go below its min size, leaving the terminal's black strip behind).
+        panel.minSize = NSSize(width: Self.sidebarWidth, height: 100)
+        panel.maxSize = NSSize(width: Self.panelSize.width, height: 10_000)
 
-        // Rounded container that defines the dropdown's visible shape and clips both panes.
-        let container = NSView(frame: initial)
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.black.cgColor
-        container.layer?.cornerRadius = 10
-        container.layer?.masksToBounds = true
-        container.layer?.borderWidth = 0.5
-        container.layer?.borderColor = NSColor.separatorColor.cgColor
+        // Rounded container that defines the dropdown's visible shape and clips both panes. Its
+        // background is the menu color (not black): when the terminal collapses, a thin sliver of
+        // this container can remain exposed on the left, so painting it the menu color keeps it
+        // seamless instead of leaving a black band. Adaptive so it tracks light/dark mode.
+        let container = AdaptiveBackgroundView(frame: initial)
+        container.backgroundColor = .windowBackgroundColor
+        container.cornerRadius = 10
+        container.borderWidth = 0.5
+        container.borderColor = .separatorColor
 
         // Terminal pane (left, flexible).
         let host = NSView(frame: NSRect(x: 0, y: 0,
@@ -130,6 +140,7 @@ final class MainWindowController: NSObject {
         sep.borderWidth = 0
         sep.fillColor = .separatorColor
         sep.autoresizingMask = [.minXMargin, .height]
+        divider = sep
 
         container.addSubview(host)
         container.addSubview(sep)
@@ -148,6 +159,7 @@ final class MainWindowController: NSObject {
         sidebar.onSearch = { [weak self] text in self?.applySearch(text) }
         sidebar.onNewCommand = { [weak self] in self?.quickLaunch() }
         sidebar.onClearHistory = { [weak self] in self?.clearHistory() }
+        sidebar.onEmptyClick = { [weak self] in self?.deselect() }
 
         setupHeaderControls()
 
@@ -212,6 +224,7 @@ final class MainWindowController: NSObject {
     }
 
     func show(relativeTo button: NSStatusBarButton) {
+        updateLayout()
         position(below: button)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
@@ -232,6 +245,33 @@ final class MainWindowController: NSObject {
         isPanelOpen = false
         stopRefreshTimer()
         resourceSampler.setActive(false)
+    }
+
+    /// Reveals the terminal pane (full-width panel) when a job is selected, or collapses the
+    /// panel down to just the menu when nothing is active. The menu stays anchored under the
+    /// status item; its now-exposed left corners are rounded by the container's clip.
+    private func updateLayout() {
+        let collapsed = (shownView == nil)
+        terminalHost.isHidden = collapsed
+        divider.isHidden = collapsed
+
+        let targetWidth = collapsed ? Self.sidebarWidth : Self.panelSize.width
+        guard panel.frame.width != targetWidth else { return }
+
+        // Keep the right edge (under the status item) fixed while the width changes. Anchor to the
+        // stored top-right rather than the live frame, so repeated collapse/expand can't drift.
+        var frame = panel.frame
+        let right = anchorTopRight?.x ?? frame.maxX
+        frame.size.width = targetWidth
+        frame.origin.x = right - targetWidth
+        if isPanelOpen, let visible = (panel.screen ?? NSScreen.main)?.visibleFrame,
+           frame.origin.x < visible.minX + 8 {
+            frame.origin.x = visible.minX + 8
+        }
+        panel.setFrame(frame, display: isPanelOpen)
+        // A transparent, borderless window keeps the shadow of its previous (larger) frame after
+        // shrinking; recompute it so no ghost outline lingers beside the collapsed menu.
+        panel.invalidateShadow()
     }
 
     /// Keeps time-based sidebar fields (job age, live status) ticking while the panel is visible.
@@ -271,6 +311,7 @@ final class MainWindowController: NSObject {
             if origin.y < visible.minY + 8 { origin.y = visible.minY + 8 }
         }
         panel.setFrameOrigin(origin)
+        anchorTopRight = NSPoint(x: origin.x + size.width, y: origin.y + size.height)
     }
 
     // MARK: - Selection
@@ -280,8 +321,12 @@ final class MainWindowController: NSObject {
         if shownView !== job?.terminalView {
             shownView?.removeFromSuperview()
         }
-        if let job {
-            let view = job.terminalView
+        shownView = job?.terminalView
+        selectedJobId = job?.id
+        // Expand to reveal the terminal pane (or collapse to just the menu) before laying out
+        // the view, so it sizes against the final host bounds.
+        updateLayout()
+        if let job, let view = shownView {
             view.removeFromSuperview()
             // Terminal grid sits below the header, inset on all sides.
             let b = terminalHost.bounds
@@ -297,13 +342,9 @@ final class MainWindowController: NSObject {
             terminalHeader.layer?.backgroundColor = bg.cgColor
             headerLabel.attributedStringValue = Self.headerText(for: job)
             terminalHeader.isHidden = false
-            shownView = view
-            selectedJobId = job.id
             emptyLabel.isHidden = true
             panel.makeFirstResponder(view)
         } else {
-            shownView = nil
-            selectedJobId = nil
             emptyLabel.isHidden = false
             terminalHeader.isHidden = true
         }
@@ -341,15 +382,22 @@ final class MainWindowController: NSObject {
         reloadSidebar()
     }
 
+    /// Clicking empty space in the menu clears the selection and collapses the terminal pane.
+    private func deselect() {
+        guard selectedJobId != nil else { return }
+        applySelection(nil)
+        reloadSidebar()
+    }
+
     /// Reconciles selection with the current job list, then redraws the sidebar.
     private func rebuild() {
         let jobs = store.jobs
-        if let sel = selectedJobId, store.job(id: sel) == nil {
-            // The selected job was removed — fall back to the newest running job, else the newest job.
-            applySelection(jobs.last(where: { $0.status == .running }) ?? jobs.last)
-        } else if selectedJobId == nil, let newest = jobs.last {
-            // Nothing selected yet — surface the newest job.
-            applySelection(newest)
+        let selectionValid = selectedJobId.map { store.job(id: $0) != nil } ?? false
+        if !selectionValid {
+            // No valid selection — surface the newest *running* job, or stay collapsed on just the
+            // menu when nothing is active (no running command, or no commands at all). A stopped
+            // job is only shown when the user explicitly clicks it.
+            applySelection(jobs.last(where: { $0.status == .running }))
         }
         reloadSidebar()
     }
@@ -660,6 +708,8 @@ final class JobSidebar: NSView, NSSearchFieldDelegate {
     var onSearch: ((String) -> Void)?
     var onNewCommand: (() -> Void)?
     var onClearHistory: (() -> Void)?
+    /// Fired when the user clicks empty space in the menu (not on a row or control).
+    var onEmptyClick: (() -> Void)?
 
     private let scrollView = NSScrollView()
     private let listView = FlippedView()
@@ -677,7 +727,6 @@ final class JobSidebar: NSView, NSSearchFieldDelegate {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
         // Footer (Settings / Quit) pinned to the bottom.
         let footer = NSView(frame: NSRect(x: 0, y: 0, width: frameRect.width, height: Self.footerHeight))
@@ -772,7 +821,22 @@ final class JobSidebar: NSView, NSSearchFieldDelegate {
         scrollView.scrollerStyle = .overlay
         scrollView.drawsBackground = false
         scrollView.documentView = listView
+        listView.onBackgroundClick = { [weak self] in self?.onEmptyClick?() }
         addSubview(scrollView)
+    }
+
+    // Resolve the background through `updateLayer` rather than a one-time `layer.backgroundColor`
+    // assignment, so it re-resolves whenever the system flips between light and dark mode (a raw
+    // cgColor would stay frozen at its launch-time value and turn unreadable after the switch).
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+    }
+
+    /// Clicks landing on the sidebar's own background (margins, top/search bars) count as
+    /// empty-space clicks; rows and controls consume their own clicks before reaching here.
+    override func mouseDown(with event: NSEvent) {
+        onEmptyClick?()
     }
 
     @objc private func segmentChanged() {
@@ -1067,7 +1131,7 @@ final class JobRowView: NSView {
         case .running:
             // Drop the cwd when resources are shown — the cwd already lives in the terminal header.
             if let cpu = job.cpuPercent, let mem = job.memBytes {
-                return "\(job.ageDescription) · \(Int(cpu.rounded()))% · \(formatBytes(mem))"
+                return "\(Int(cpu.rounded()))% · \(formatBytes(mem)) · \(job.ageDescription)"
             }
             return "\(job.displayCwd) · \(job.ageDescription)"
         case .stopped(let code):
@@ -1187,10 +1251,41 @@ final class HistoryRowView: NSView {
 /// Top-down list coordinates so rows lay out from the top of the scroll view.
 private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
+    /// Forwarded when the user clicks the empty area below the rows.
+    var onBackgroundClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onBackgroundClick?() }
 }
 
 /// A borderless panel that can still become key, so the embedded terminal receives keystrokes.
 final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+}
+
+/// A layer-backed view whose background, border, and corner radius re-resolve on every appearance
+/// change. Assigning `layer.backgroundColor = nsColor.cgColor` directly freezes the color at the
+/// appearance active when it ran, so the view would stay light after the system switches to dark
+/// mode (and vice-versa); driving it through `updateLayer` keeps it correct across the switch.
+final class AdaptiveBackgroundView: NSView {
+    var backgroundColor: NSColor = .clear { didSet { needsDisplay = true } }
+    var borderColor: NSColor? { didSet { needsDisplay = true } }
+    var borderWidth: CGFloat = 0 { didSet { needsDisplay = true } }
+    var cornerRadius: CGFloat = 0 { didSet { needsDisplay = true } }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        guard let layer else { return }
+        layer.backgroundColor = backgroundColor.cgColor
+        layer.cornerRadius = cornerRadius
+        layer.masksToBounds = cornerRadius > 0
+        layer.borderWidth = borderWidth
+        layer.borderColor = borderColor?.cgColor
+    }
 }
